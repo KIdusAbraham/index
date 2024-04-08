@@ -1,0 +1,127 @@
+USE [DBATools]
+GO
+
+/****** Object:  StoredProcedure [dbo].[sp_DBA_DriveSpaceCheck]    Script Date: 4/8/2024 10:11:32 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+
+
+
+CREATE PROCEDURE [dbo].[sp_DBA_DriveSpaceCheck]
+
+(
+@PageAlertPercent int=10,
+@GBThresh int 
+)
+
+AS
+
+SET NOCOUNT ON
+DECLARE @syscnt INT
+DECLARE @PageAlertPct INT = @PageAlertPercent
+DECLARE @GBThreshold INT = @GBThresh
+declare @sysdriveMB int = 2048
+Declare @Emailsubject nvarchar(1000)
+Declare @Pagesubject nvarchar(1000)
+Declare @Pagesubjectuser nvarchar(1000)
+Declare @tableHTMLEmail nvarchar(max)  = ''
+Declare @tableHTMLPage nvarchar(max)  = ''
+Declare @SQLDBArunbook nvarchar(max) 
+Declare @Emailtitel nvarchar(max)
+Declare @EmailandPagerTo  VARCHAR(100) = 'kboryszewski@assurecare.com'
+
+
+--IF DATENAME(WEEKDAY,GETDATE()) = 'Monday' AND DATEPART(hh, GETDATE()) IN (8,9,10)
+
+BEGIN
+
+      INSERT INTO DBATools..tbl_SpaceTracking
+		  SELECT DISTINCT 
+					STATS.volume_mount_point ,
+				  ((STATS.total_bytes / 1024) / 1024), 
+				  ((STATS.available_bytes / 1024) / 1024),
+				  (((STATS.total_bytes / 1024) / 1024)/1024) , 
+				  (((STATS.available_bytes / 1024) / 1024)/1024),
+				  (((STATS.available_bytes / 1024) / 1024) *100)/((STATS.total_bytes / 1024) / 1024),
+				  GETDATE()
+		  FROM  sys.master_files FILES 
+		  CROSS APPLY sys.dm_os_volume_stats (FILES.database_id, FILES.file_id) STATS
+
+      DELETE FROM DBATools..tbl_SpaceTracking WHERE ChkDate < GETDATE()- 366
+END
+
+BEGIN
+
+      DECLARE @spacecheck TABLE(
+						[Drive] NVARCHAR(256) NULL,
+						[TotalGB] BIGINT NULL,
+						[FreeGB] BIGINT NULL,
+						[FreePerc] BIGINT NULL,
+						[ChkDate] DATETIME NOT NULL
+					  )
+
+       INSERT INTO @spacecheck
+	        SELECT DISTINCT STATS.volume_mount_point as [Drive] 
+			     , (((STATS.total_bytes / 1024) / 1024)/1024) as [TotalGB]
+				 , (((STATS.available_bytes / 1024) / 1024)/1024) as [FreeGB]
+				 , (((STATS.available_bytes / 1024) / 1024) *100)/((STATS.total_bytes / 1024) / 1024) as [FreePerc] 
+				 , GETDATE()
+			FROM  sys.master_files FILES
+			CROSS APPLY sys.dm_os_volume_stats (FILES.database_id, FILES.file_id) STATS
+if(
+			select count (1) from @spacecheck where  FreeGB<@GBThresh and Drive <> 'C:\' ) > 0
+			BEGIN
+			                               -- WHERE FreePerc < @PageAlertPct and FreeGB<40
+set @Pagesubject =   'SQLQC Alert (Critical)  - SQL Server Drive low space detected on' + ' '  + @@servername
+--general title
+set @Emailtitel =N'<H3><FONT SIZE="2" FACE="Tahoma">'+@@servername+': Drives Low space detected at ' + '  ' + CONVERT(varchar(30), getdate(), 120) + '.  Drive space below 90% or less than 100GB.  See tbl_SpaceTracking for more historical data. </FONT></H3>'
+--Direct to SQLDBA RUNBOOK
+ set @tableHTMLPage = @Emailtitel+ N'<table border="1">' +
+              N'<FONT SIZE="2" FACE="Calibri">' +           
+             N'<tr><th align="center">DriveName</th>' +
+             N'<th align="center">TotalGB</th>' +
+             N'<th align="center">FreeGB</th>' +
+             N'<th align="center">FreePerc</th>' +
+             N'<th align="center">ChkDate</th>' +
+             N'</tr>' +
+                           ISNULL(CAST ( (
+                                               select td = '',
+                                                     td = Drive,'',
+                                                     td = TotalGB,'',
+                                                     td = FreeGB,'',
+                                                     td = FreePerc,'',
+                                                     td = ChkDate,''
+                                                     from @spacecheck
+                                        WHERE  FreeGB<@GBThresh and Drive <> 'C:\' 
+                                        FOR XML PATH('tr'), TYPE
+                           ) AS NVARCHAR(MAX) ),'') +
+             N'</FONT>' +
+             N'</table>' 
+
+IF EXISTS (Select 1 from @spacecheck WHERE FreePerc < @PageAlertPct) 
+BEGIN
+    EXEC msdb.dbo.Sp_send_dbmail @profile_name = 'Database Notifications',
+                                @body = @tableHTMLPage,
+                                @body_format = 'HTML',
+                                @recipients   = @EmailandPagerTo,
+                                @subject      = @Pagesubject ;                                            
+
+       EXEC xp_logevent 50001, @Pagesubject, 'ERROR'
+END
+			end
+			else
+			begin
+			print 'No issues found.'
+			end
+        
+END
+GO
+
+
