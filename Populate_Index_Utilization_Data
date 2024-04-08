@@ -1,0 +1,907 @@
+USE [DBATools]
+GO
+
+/****** Object:  StoredProcedure [dbo].[Populate_Index_Utilization_Data]    Script Date: 4/8/2024 10:10:39 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+/*	This stored procedure is intended to run semi-regularly (every 4-6 hours is likely sufficient) and will populate the table dbo.Missing_Index_Details
+	with missing index data from the appropriate DMVs.  This information can then be used in researching which indexes are not used, underused,
+	or misused.
+*/
+
+CREATE PROCEDURE [dbo].[Populate_Index_Utilization_Data]
+	@Retention_Period_for_Detail_Data_Days TINYINT = 14, -- How many days of data should be retained in Index_Utilization_Detail.
+	@Retention_Period_for_Daily_Data_Days TINYINT = 30, -- How many days of data should be retained in Index_Utilization_Daily_Stats.  On a server with many databases, this can get large fast.  If that is the case, set this to a low number as it'll be one entry per database per index per execution of the proc.
+	@Truncate_All_Summary_Data BIT = 0, -- If set to 1, will truncate all data in Index_Utilization_Summary.  This is useful after major app changes, migrations, or when this data is too old/long-term.
+	@Aggregate_All_Database_Data BIT = 0 -- If set to 1, all collected data will use "ALL" instad of the database name.  This is useful in multi-tenant environments with many databases containing the same schema/usage patterns.
+	-- This bit should be set and kept with the same value long-term.  Switching this back and forth will lead to confusing data points.  If changing this, clearing out (or aggregating) all existing data first is recommended.
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	IF @Retention_Period_for_Detail_Data_Days IS NULL OR @Retention_Period_for_Daily_Data_Days IS NULL OR @Truncate_All_Summary_Data IS NULL OR @Aggregate_All_Database_Data IS NULL
+	BEGIN
+		RAISERROR('An explicit NULL cannot be passed into any of the stored procedure parmaeters!', 16, 1);
+		RETURN;
+	END
+
+	-- Remove old detail/daily stats data based on the proc parameter.  There is little need to save this data long-term if it being crunched elsewhere.
+	DELETE Index_Utilization_Detail
+	FROM dbo.Index_Utilization_Detail
+	WHERE Index_Utilization_Detail.Index_Utilization_Detail_Create_Datetime < DATEADD(DAY, -1 * @Retention_Period_for_Detail_Data_Days, CURRENT_TIMESTAMP);
+
+	DELETE Index_Utilization_Daily_Stats
+	FROM dbo.Index_Utilization_Daily_Stats
+	WHERE Index_Utilization_Daily_Stats.Index_Utilization_Daily_Stats_Date < DATEADD(DAY, -1 * @Retention_Period_for_Daily_Data_Days, CURRENT_TIMESTAMP);
+
+	-- If the @Truncate_All_Summary_Data flag is set to 1, then delete ALL summary data.
+	IF @Truncate_All_Summary_Data = 1
+	BEGIN
+		TRUNCATE TABLE dbo.Index_Utilization_Summary;
+	END
+
+	DECLARE @Index_Collection_Timestamp DATETIME = CURRENT_TIMESTAMP;
+	DECLARE @Index_Collection_Date DATE = CAST(CURRENT_TIMESTAMP AS DATE);
+
+	-- Generate a database list so that we collect data from all databases on the server
+	DECLARE @Database_List TABLE
+		(	[Database_Name] SYSNAME NOT NULL,
+			Is_Processed BIT NOT NULL);
+
+	DECLARE @Sql_Command NVARCHAR(MAX);
+	DECLARE @Current_Database_Name SYSNAME;
+
+	INSERT INTO @Database_List
+		([Database_Name], Is_Processed)
+	SELECT
+		databases.name AS [Database_Name],
+		0 AS Is_Processed
+	FROM sys.databases
+	WHERE databases.name NOT IN ('master', 'msdb', 'model', 'tempdb', 'ReportServerTempDB', 'ReportServer')
+	AND databases.state_desc = 'ONLINE';
+	
+	CREATE TABLE #Index_Utilization_Detail
+	(	Index_Utilization_Detail_Create_Datetime DATETIME NOT NULL,
+		[Database_Name] SYSNAME,
+		[Schema_Name] SYSNAME,
+		Table_Name SYSNAME,
+		Index_Name SYSNAME,
+		User_Seek_Count BIGINT,
+		User_Scan_Count BIGINT,
+		User_Lookup_Count BIGINT,
+		User_Update_Count BIGINT,
+		Last_User_Seek DATETIME,
+		Last_User_Scan DATETIME,
+		Last_User_Lookup DATETIME,
+		Last_User_Update DATETIME,
+		Is_Primary_Key BIT NOT NULL,
+		Is_Clustered_Index BIT NOT NULL	);
+
+	CREATE TABLE #All_Indexes
+	(	All_Indexes_Id INT NOT NULL IDENTITY(1,1) PRIMARY KEY CLUSTERED,
+		[Database_Name] SYSNAME NOT NULL,
+		[Schema_Name] SYSNAME NOT NULL,
+		Table_Name SYSNAME NOT NULL,
+		Index_Name SYSNAME NOT NULL,
+		Is_Primary_Key BIT NOT NULL,
+		Is_Clustered_Index BIT NOT NULL	);
+
+	-- Loop through each database and collect index stats for each.  Also collect index metadata so that we can check for completely unused indexes which will not
+	-- appear in index usage stats DMV data.
+	WHILE EXISTS (SELECT * FROM @Database_List Database_List WHERE Database_List.Is_Processed = 0)
+	BEGIN
+		SELECT TOP 1
+			@Current_Database_Name = Database_List.[Database_Name]
+		FROM @Database_List Database_List
+		WHERE Database_List.Is_Processed = 0
+
+		SELECT
+			@Sql_Command = 
+			'	USE [' + @Current_Database_Name + ']
+				INSERT INTO #Index_Utilization_Detail
+					(Index_Utilization_Detail_Create_Datetime, [Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count,
+					 User_Scan_Count, User_Lookup_Count, User_Update_Count, Last_User_Seek, Last_User_Scan, Last_User_Lookup, Last_User_Update,
+					 Is_Primary_Key, Is_Clustered_Index)
+				SELECT
+					''' + CAST(@Index_Collection_Timestamp AS NVARCHAR(MAX)) + ''' AS Index_Utilization_Detail_Create_Datetime,
+					''' + @Current_Database_Name + ''' AS [Database_Name],
+					schemas.name AS [Schema_Name],
+					tables.name AS Table_Name,
+					indexes.name AS Index_Name,
+					dm_db_index_usage_stats.user_seeks AS User_Seek_Count,
+					dm_db_index_usage_stats.user_scans AS User_Scan_Count,
+					dm_db_index_usage_stats.user_lookups AS User_Lookup_Count,
+					dm_db_index_usage_stats.user_updates AS User_Update_Count,
+					dm_db_index_usage_stats.last_user_seek AS Last_User_Seek,
+					dm_db_index_usage_stats.last_user_scan AS Last_User_Scan,
+					dm_db_index_usage_stats.last_user_lookup AS Last_User_Lookup,
+					dm_db_index_usage_stats.last_user_update AS Last_User_Update,
+					ISNULL(indexes.is_primary_key, 0) AS Is_Primary_Key,
+					ISNULL(CASE WHEN indexes.type_desc = ''CLUSTERED'' THEN 1 ELSE 0 END, 0) AS Is_Clustered_Index
+				FROM [' + @Current_Database_Name + '].sys.dm_db_index_usage_stats
+				INNER JOIN [' + @Current_Database_Name + '].sys.indexes
+				ON indexes.object_id = dm_db_index_usage_stats.object_id
+				AND indexes.index_id = dm_db_index_usage_stats.index_id
+				INNER JOIN [' + @Current_Database_Name + '].sys.tables
+				ON tables.object_id = indexes.object_id
+				INNER JOIN [' + @Current_Database_Name + '].sys.schemas
+				ON schemas.schema_id = tables.schema_id
+				WHERE dm_db_index_usage_stats.database_id = (SELECT DB_ID(''' + @Current_Database_Name + '''))
+				AND indexes.name IS NOT NULL;
+				
+				INSERT INTO #All_Indexes
+					([Database_Name], [Schema_Name], Table_Name, Index_Name, Is_Primary_Key, Is_Clustered_Index)
+				SELECT
+					''' + @Current_Database_Name + ''' AS [Database_Name],
+					schemas.name COLLATE DATABASE_DEFAULT AS [Schema_Name],
+					tables.name COLLATE DATABASE_DEFAULT AS Table_Name,
+					indexes.name COLLATE DATABASE_DEFAULT AS Index_Name,
+					ISNULL(indexes.is_primary_key, 0) AS Is_Primary_Key,
+					ISNULL(CASE WHEN indexes.type_desc = ''CLUSTERED'' THEN 1 ELSE 0 END, 0) AS Is_Clustered_Index
+				FROM [' + @Current_Database_Name + '].sys.indexes
+				INNER JOIN [' + @Current_Database_Name + '].sys.tables
+				ON indexes.object_id = tables.object_id
+				INNER JOIN [' + @Current_Database_Name + '].sys.schemas
+				ON schemas.schema_id = tables.schema_id
+				WHERE indexes.name IS NOT NULL;';
+		
+		EXEC sp_executesql @Sql_Command;
+
+		UPDATE Database_List
+			SET Is_Processed = 1
+		FROM @Database_List Database_List
+		WHERE [Database_Name] = @Current_Database_Name;
+	END
+	-- Index_Utilization_Detail is a copy of the DMV data.  Insert the data collected above as-is.
+	INSERT INTO dbo.Index_Utilization_Detail
+		(	Index_Utilization_Detail_Create_Datetime, [Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count,
+	  		User_Scan_Count, User_Lookup_Count, User_Update_Count, Last_User_Seek, Last_User_Scan, Last_User_Lookup, Last_User_Update,
+			Is_Primary_Key, Is_Clustered_Index	)
+	SELECT
+		*
+	FROM #Index_Utilization_Detail;
+
+	-- Generate summary data, which is an all-time collection of data, by index.
+	IF @Aggregate_All_Database_Data = 0
+	BEGIN
+		MERGE INTO dbo.Index_Utilization_Summary AS Utilization_Target
+		USING (	SELECT
+					*
+				FROM #Index_Utilization_Detail	) AS Utilization_Source
+		ON (	Utilization_Target.[Database_Name] = Utilization_Source.[Database_Name]
+				AND Utilization_Target.[Schema_Name] = Utilization_Source.[Schema_Name]
+				AND Utilization_Target.Table_Name = Utilization_Source.Table_Name
+				AND Utilization_Target.Index_Name = Utilization_Source.Index_Name	)
+		WHEN MATCHED
+			THEN UPDATE
+				SET User_Seek_Count_Total = CASE 
+										 WHEN Utilization_Source.User_Seek_Count = Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Target.User_Seek_Count_Total
+							  			 WHEN Utilization_Source.User_Seek_Count >= Utilization_Target.User_Seek_Count_Total
+											THEN Utilization_Source.User_Seek_Count + Utilization_Target.User_Seek_Count_Total - Utilization_Target.User_Seek_Count_Last_Update
+										 WHEN Utilization_Source.User_Seek_Count < Utilization_Target.User_Seek_Count_Total
+										 AND Utilization_Source.User_Seek_Count < Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Target.User_Seek_Count_Total + Utilization_Source.User_Seek_Count
+										 WHEN Utilization_Source.User_Seek_Count < Utilization_Target.User_Seek_Count_Total
+										 AND Utilization_Source.User_Seek_Count > Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Source.User_Seek_Count + Utilization_Target.User_Seek_Count_Total - Utilization_Target.User_Seek_Count_Last_Update
+									  END,
+					User_Scan_Count_Total = CASE 
+										 WHEN Utilization_Source.User_Scan_Count = Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Target.User_Scan_Count_Total
+							  			 WHEN Utilization_Source.User_Scan_Count >= Utilization_Target.User_Scan_Count_Total
+											THEN Utilization_Source.User_Scan_Count + Utilization_Target.User_Scan_Count_Total - Utilization_Target.User_Scan_Count_Last_Update
+										 WHEN Utilization_Source.User_Scan_Count < Utilization_Target.User_Scan_Count_Total
+										 AND Utilization_Source.User_Scan_Count < Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Target.User_Scan_Count_Total + Utilization_Source.User_Scan_Count
+										 WHEN Utilization_Source.User_Scan_Count < Utilization_Target.User_Scan_Count_Total
+										 AND Utilization_Source.User_Scan_Count > Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Source.User_Scan_Count + Utilization_Target.User_Scan_Count_Total - Utilization_Target.User_Scan_Count_Last_Update
+									  END,
+					User_Lookup_Count_Total = CASE 
+										 WHEN Utilization_Source.User_Lookup_Count = Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Target.User_Lookup_Count_Total
+							  			 WHEN Utilization_Source.User_Lookup_Count >= Utilization_Target.User_Lookup_Count_Total
+											THEN Utilization_Source.User_Lookup_Count + Utilization_Target.User_Lookup_Count_Total - Utilization_Target.User_Lookup_Count_Last_Update
+										 WHEN Utilization_Source.User_Lookup_Count < Utilization_Target.User_Lookup_Count_Total
+										 AND Utilization_Source.User_Lookup_Count < Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Target.User_Lookup_Count_Total + Utilization_Source.User_Lookup_Count
+										 WHEN Utilization_Source.User_Lookup_Count < Utilization_Target.User_Lookup_Count_Total
+										 AND Utilization_Source.User_Lookup_Count > Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Source.User_Lookup_Count + Utilization_Target.User_Lookup_Count_Total - Utilization_Target.User_Lookup_Count_Last_Update
+									  END,
+					User_Update_Count_Total = CASE 
+										 WHEN Utilization_Source.User_Update_Count = Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Target.User_Update_Count_Total
+							  			 WHEN Utilization_Source.User_Update_Count >= Utilization_Target.User_Update_Count_Total
+											THEN Utilization_Source.User_Update_Count + Utilization_Target.User_Update_Count_Total - Utilization_Target.User_Update_Count_Last_Update
+										 WHEN Utilization_Source.User_Update_Count < Utilization_Target.User_Update_Count_Total
+										 AND Utilization_Source.User_Update_Count < Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Target.User_Update_Count_Total + Utilization_Source.User_Update_Count
+										 WHEN Utilization_Source.User_Update_Count < Utilization_Target.User_Update_Count_Total
+										 AND Utilization_Source.User_Update_Count > Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Source.User_Update_Count + Utilization_Target.User_Update_Count_Total - Utilization_Target.User_Update_Count_Last_Update
+									  END,
+					Last_User_Seek = CASE
+										WHEN Utilization_Source.Last_User_Seek IS NULL THEN Utilization_Target.Last_User_Seek
+										WHEN Utilization_Target.Last_User_Seek IS NULL THEN Utilization_Source.Last_User_Seek
+										WHEN Utilization_Source.Last_User_Seek < Utilization_Target.Last_User_Seek THEN Utilization_Target.Last_User_Seek
+										ELSE Utilization_Source.Last_User_Seek
+									 END,
+					Last_User_Scan = CASE
+										WHEN Utilization_Source.Last_User_Scan IS NULL THEN Utilization_Target.Last_User_Scan
+										WHEN Utilization_Target.Last_User_Scan IS NULL THEN Utilization_Source.Last_User_Scan
+										WHEN Utilization_Source.Last_User_Scan < Utilization_Target.Last_User_Scan THEN Utilization_Target.Last_User_Scan
+										ELSE Utilization_Source.Last_User_Scan
+									 END,
+					Last_User_Lookup = CASE
+										WHEN Utilization_Source.Last_User_Lookup IS NULL THEN Utilization_Target.Last_User_Lookup
+										WHEN Utilization_Target.Last_User_Lookup IS NULL THEN Utilization_Source.Last_User_Lookup
+										WHEN Utilization_Source.Last_User_Lookup < Utilization_Target.Last_User_Lookup THEN Utilization_Target.Last_User_Lookup
+										ELSE Utilization_Source.Last_User_Lookup
+									 END,
+					Last_User_Update = CASE
+										WHEN Utilization_Source.Last_User_Update IS NULL THEN Utilization_Target.Last_User_Update
+										WHEN Utilization_Target.Last_User_Update IS NULL THEN Utilization_Source.Last_User_Update
+										WHEN Utilization_Source.Last_User_Update < Utilization_Target.Last_User_Update THEN Utilization_Target.Last_User_Update
+										ELSE Utilization_Source.Last_User_Update
+									 END,
+					Index_Utilization_Summary_Last_Update_Datetime = CURRENT_TIMESTAMP,
+					User_Seek_Count_Last_Update = Utilization_Source.User_Seek_Count,
+					User_Scan_Count_Last_Update = Utilization_Source.User_Scan_Count,
+					User_Lookup_Count_Last_Update = Utilization_Source.User_Lookup_Count,
+					User_Update_Count_Last_Update = Utilization_Source.User_Update_Count,
+					Is_Unused = 0,
+					Is_Dropped = 0
+		WHEN NOT MATCHED BY TARGET
+			THEN INSERT
+				(	[Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count_Total, User_Scan_Count_Total, User_Lookup_Count_Total, User_Update_Count_Total, Last_User_Seek,
+	  				Last_User_Scan, Last_User_Lookup, Last_User_Update, Index_Utilization_Summary_Create_Datetime, Index_Utilization_Summary_Last_Update_Datetime,
+					User_Seek_Count_Last_Update, User_Scan_Count_Last_Update, User_Lookup_Count_Last_Update, User_Update_Count_Last_Update,
+					Is_Primary_Key, Is_Clustered_Index, Is_Unused, Is_Dropped	)
+			VALUES
+				(	Utilization_Source.[Database_Name],
+					Utilization_Source.[Schema_Name],
+					Utilization_Source.Table_Name,
+					Utilization_Source.Index_Name,
+					Utilization_Source.User_Seek_Count,
+					Utilization_Source.User_Scan_Count,
+					Utilization_Source.User_Lookup_Count,
+					Utilization_Source.User_Update_Count,
+					Utilization_Source.Last_User_Seek,
+	  				Utilization_Source.Last_User_Scan,
+					Utilization_Source.Last_User_Lookup,
+					Utilization_Source.Last_User_Update,
+					CURRENT_TIMESTAMP,
+					CURRENT_TIMESTAMP,
+					Utilization_Source.User_Seek_Count,
+					Utilization_Source.User_Scan_Count,
+					Utilization_Source.User_Lookup_Count,
+					Utilization_Source.User_Update_Count,
+					Utilization_Source.Is_Primary_Key,
+					Utilization_Source.Is_Clustered_Index,
+					0,
+					0
+				)
+		WHEN NOT MATCHED BY SOURCE AND Utilization_Target.Is_Dropped = 0 AND Utilization_Target.Is_Unused = 0
+			THEN UPDATE
+				SET Index_Utilization_Summary_Last_Update_Datetime = CURRENT_TIMESTAMP,
+					Is_Unused = 1;
+	END
+	ELSE -- If data is to be pre-aggregated by index, then do so here
+	BEGIN
+		MERGE INTO dbo.Index_Utilization_Summary AS Utilization_Target
+		USING (	SELECT
+					MAX(Index_Utilization_Detail.Index_Utilization_Detail_Create_Datetime) AS Index_Utilization_Detail_Create_Datetime,
+					'ALL' AS [Database_Name],
+					Index_Utilization_Detail.[Schema_Name],
+					Index_Utilization_Detail.Table_Name,
+					Index_Utilization_Detail.Index_Name,
+					SUM(Index_Utilization_Detail.User_Seek_Count) AS User_Seek_Count,
+					SUM(Index_Utilization_Detail.User_Scan_Count) AS User_Scan_Count,
+					SUM(Index_Utilization_Detail.User_Lookup_Count) AS User_Lookup_Count,
+					SUM(Index_Utilization_Detail.User_Update_Count) AS User_Update_Count,
+					MAX(Index_Utilization_Detail.Last_User_Seek) AS Last_User_Seek,
+					MAX(Index_Utilization_Detail.Last_User_Scan) AS Last_User_Scan,
+					MAX(Index_Utilization_Detail.Last_User_Lookup) AS Last_User_Lookup,
+					MAX(Index_Utilization_Detail.Last_User_Update) AS Last_User_Update,
+					MAX(CAST(Index_Utilization_Detail.Is_Primary_Key AS TINYINT)) AS Is_Primary_Key,
+					MAX(CAST(Index_Utilization_Detail.Is_Clustered_Index AS TINYINT)) AS Is_Clustered_Index
+				FROM #Index_Utilization_Detail Index_Utilization_Detail
+				GROUP BY Index_Utilization_Detail.[Schema_Name], Index_Utilization_Detail.Table_Name, Index_Utilization_Detail.Index_Name
+				) AS Utilization_Source
+		ON (	Utilization_Target.[Database_Name] = 'ALL'
+				AND Utilization_Target.[Schema_Name] = Utilization_Source.[Schema_Name]
+				AND Utilization_Target.Table_Name = Utilization_Source.Table_Name
+				AND Utilization_Target.Index_Name = Utilization_Source.Index_Name	)
+		WHEN MATCHED
+			THEN UPDATE
+				SET User_Seek_Count_Total = CASE 
+										 WHEN Utilization_Source.User_Seek_Count = Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Target.User_Seek_Count_Total
+							  			 WHEN Utilization_Source.User_Seek_Count >= Utilization_Target.User_Seek_Count_Total
+											THEN Utilization_Source.User_Seek_Count + Utilization_Target.User_Seek_Count_Total - Utilization_Target.User_Seek_Count_Last_Update
+										 WHEN Utilization_Source.User_Seek_Count < Utilization_Target.User_Seek_Count_Total
+										 AND Utilization_Source.User_Seek_Count < Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Target.User_Seek_Count_Total + Utilization_Source.User_Seek_Count
+										 WHEN Utilization_Source.User_Seek_Count < Utilization_Target.User_Seek_Count_Total
+										 AND Utilization_Source.User_Seek_Count > Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Source.User_Seek_Count + Utilization_Target.User_Seek_Count_Total - Utilization_Target.User_Seek_Count_Last_Update
+									  END,
+					User_Scan_Count_Total = CASE 
+										 WHEN Utilization_Source.User_Scan_Count = Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Target.User_Scan_Count_Total
+							  			 WHEN Utilization_Source.User_Scan_Count >= Utilization_Target.User_Scan_Count_Total
+											THEN Utilization_Source.User_Scan_Count + Utilization_Target.User_Scan_Count_Total - Utilization_Target.User_Scan_Count_Last_Update
+										 WHEN Utilization_Source.User_Scan_Count < Utilization_Target.User_Scan_Count_Total
+										 AND Utilization_Source.User_Scan_Count < Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Target.User_Scan_Count_Total + Utilization_Source.User_Scan_Count
+										 WHEN Utilization_Source.User_Scan_Count < Utilization_Target.User_Scan_Count_Total
+										 AND Utilization_Source.User_Scan_Count > Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Source.User_Scan_Count + Utilization_Target.User_Scan_Count_Total - Utilization_Target.User_Scan_Count_Last_Update
+									  END,
+					User_Lookup_Count_Total = CASE 
+										 WHEN Utilization_Source.User_Lookup_Count = Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Target.User_Lookup_Count_Total
+							  			 WHEN Utilization_Source.User_Lookup_Count >= Utilization_Target.User_Lookup_Count_Total
+											THEN Utilization_Source.User_Lookup_Count + Utilization_Target.User_Lookup_Count_Total - Utilization_Target.User_Lookup_Count_Last_Update
+										 WHEN Utilization_Source.User_Lookup_Count < Utilization_Target.User_Lookup_Count_Total
+										 AND Utilization_Source.User_Lookup_Count < Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Target.User_Lookup_Count_Total + Utilization_Source.User_Lookup_Count
+										 WHEN Utilization_Source.User_Lookup_Count < Utilization_Target.User_Lookup_Count_Total
+										 AND Utilization_Source.User_Lookup_Count > Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Source.User_Lookup_Count + Utilization_Target.User_Lookup_Count_Total - Utilization_Target.User_Lookup_Count_Last_Update
+									  END,
+					User_Update_Count_Total = CASE 
+										 WHEN Utilization_Source.User_Update_Count = Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Target.User_Update_Count_Total
+							  			 WHEN Utilization_Source.User_Update_Count >= Utilization_Target.User_Update_Count_Total
+											THEN Utilization_Source.User_Update_Count + Utilization_Target.User_Update_Count_Total - Utilization_Target.User_Update_Count_Last_Update
+										 WHEN Utilization_Source.User_Update_Count < Utilization_Target.User_Update_Count_Total
+										 AND Utilization_Source.User_Update_Count < Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Target.User_Update_Count_Total + Utilization_Source.User_Update_Count
+										 WHEN Utilization_Source.User_Update_Count < Utilization_Target.User_Update_Count_Total
+										 AND Utilization_Source.User_Update_Count > Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Source.User_Update_Count + Utilization_Target.User_Update_Count_Total - Utilization_Target.User_Update_Count_Last_Update
+									  END,
+					Last_User_Seek = CASE
+										WHEN Utilization_Source.Last_User_Seek IS NULL THEN Utilization_Target.Last_User_Seek
+										WHEN Utilization_Target.Last_User_Seek IS NULL THEN Utilization_Source.Last_User_Seek
+										WHEN Utilization_Source.Last_User_Seek < Utilization_Target.Last_User_Seek THEN Utilization_Target.Last_User_Seek
+										ELSE Utilization_Source.Last_User_Seek
+									 END,
+					Last_User_Scan = CASE
+										WHEN Utilization_Source.Last_User_Scan IS NULL THEN Utilization_Target.Last_User_Scan
+										WHEN Utilization_Target.Last_User_Scan IS NULL THEN Utilization_Source.Last_User_Scan
+										WHEN Utilization_Source.Last_User_Scan < Utilization_Target.Last_User_Scan THEN Utilization_Target.Last_User_Scan
+										ELSE Utilization_Source.Last_User_Scan
+									 END,
+					Last_User_Lookup = CASE
+										WHEN Utilization_Source.Last_User_Lookup IS NULL THEN Utilization_Target.Last_User_Lookup
+										WHEN Utilization_Target.Last_User_Lookup IS NULL THEN Utilization_Source.Last_User_Lookup
+										WHEN Utilization_Source.Last_User_Lookup < Utilization_Target.Last_User_Lookup THEN Utilization_Target.Last_User_Lookup
+										ELSE Utilization_Source.Last_User_Lookup
+									 END,
+					Last_User_Update = CASE
+										WHEN Utilization_Source.Last_User_Update IS NULL THEN Utilization_Target.Last_User_Update
+										WHEN Utilization_Target.Last_User_Update IS NULL THEN Utilization_Source.Last_User_Update
+										WHEN Utilization_Source.Last_User_Update < Utilization_Target.Last_User_Update THEN Utilization_Target.Last_User_Update
+										ELSE Utilization_Source.Last_User_Update
+									 END,
+					Index_Utilization_Summary_Last_Update_Datetime = CURRENT_TIMESTAMP,
+					User_Seek_Count_Last_Update = Utilization_Source.User_Seek_Count,
+					User_Scan_Count_Last_Update = Utilization_Source.User_Scan_Count,
+					User_Lookup_Count_Last_Update = Utilization_Source.User_Lookup_Count,
+					User_Update_Count_Last_Update = Utilization_Source.User_Update_Count,
+					Is_Unused = 0,
+					Is_Dropped = 0
+		WHEN NOT MATCHED BY TARGET
+			THEN INSERT
+				(	[Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count_Total, User_Scan_Count_Total, User_Lookup_Count_Total, User_Update_Count_Total, Last_User_Seek,
+	  				Last_User_Scan, Last_User_Lookup, Last_User_Update, Index_Utilization_Summary_Create_Datetime, Index_Utilization_Summary_Last_Update_Datetime,
+					User_Seek_Count_Last_Update, User_Scan_Count_Last_Update, User_Lookup_Count_Last_Update, User_Update_Count_Last_Update,
+					Is_Primary_Key, Is_Clustered_Index, Is_Unused, Is_Dropped	)
+			VALUES
+				(	'ALL',
+					Utilization_Source.[Schema_Name],
+					Utilization_Source.Table_Name,
+					Utilization_Source.Index_Name,
+					Utilization_Source.User_Seek_Count,
+					Utilization_Source.User_Scan_Count,
+					Utilization_Source.User_Lookup_Count,
+					Utilization_Source.User_Update_Count,
+					Utilization_Source.Last_User_Seek,
+	  				Utilization_Source.Last_User_Scan,
+					Utilization_Source.Last_User_Lookup,
+					Utilization_Source.Last_User_Update,
+					CURRENT_TIMESTAMP,
+					CURRENT_TIMESTAMP,
+					Utilization_Source.User_Seek_Count,
+					Utilization_Source.User_Scan_Count,
+					Utilization_Source.User_Lookup_Count,
+					Utilization_Source.User_Update_Count,
+					Utilization_Source.Is_Primary_Key,
+					Utilization_Source.Is_Clustered_Index,
+					0,
+					0
+				)
+		WHEN NOT MATCHED BY SOURCE AND Utilization_Target.Is_Dropped = 0 AND Utilization_Target.Is_Unused = 0
+			THEN UPDATE
+				SET Index_Utilization_Summary_Last_Update_Datetime = CURRENT_TIMESTAMP,
+					Is_Unused = 1;
+	END
+	
+	IF @Aggregate_All_Database_Data = 0
+	BEGIN
+		-- Set the Is_Dropped flag for non-aggregated data
+		UPDATE Index_Utilization_Summary
+			SET Is_Dropped = CASE WHEN Index_List.All_Indexes_Id IS NULL THEN 1 ELSE 0 END
+		FROM dbo.Index_Utilization_Summary
+		LEFT JOIN #All_Indexes Index_List
+		ON Index_Utilization_Summary.[Database_Name] = Index_List.[Database_Name]
+		AND Index_Utilization_Summary.[Schema_Name] = Index_List.[Schema_Name]
+		AND Index_Utilization_Summary.Table_Name = Index_List.Table_Name
+		AND Index_Utilization_Summary.Index_Name = Index_List.Index_Name
+		WHERE Index_Utilization_Summary.Is_Dropped <> CASE WHEN Index_List.All_Indexes_Id IS NULL THEN 1 ELSE 0 END;
+		-- Set Is_Dropped = 1 for any database that has been dropped.
+		UPDATE Index_Utilization_Summary
+			SET Is_Dropped = 1
+		FROM dbo.Index_Utilization_Summary
+		LEFT JOIN sys.databases
+		ON databases.name = Index_Utilization_Summary.[Database_Name]
+		WHERE Index_Utilization_Summary.Is_Dropped = 0
+		AND databases.database_id IS NULL;
+		
+	END
+	ELSE -- For aggregated data, we need to check all databases for the presence of a given index.
+	BEGIN
+		-- Set the Is_Dropped flag for aggregated data
+		UPDATE Index_Utilization_Summary
+			SET Is_Dropped = CASE WHEN Index_List.All_Indexes_Id IS NULL THEN 1 ELSE 0 END
+		FROM dbo.Index_Utilization_Summary
+		LEFT JOIN #All_Indexes Index_List
+		ON Index_Utilization_Summary.[Schema_Name] = Index_List.[Schema_Name]
+		AND Index_Utilization_Summary.Table_Name = Index_List.Table_Name
+		AND Index_Utilization_Summary.Index_Name = Index_List.Index_Name
+		WHERE Index_Utilization_Summary.Is_Dropped <> CASE WHEN Index_List.All_Indexes_Id IS NULL THEN 1 ELSE 0 END;
+	END
+
+	-- Populate the daily stats table accordingly.
+	IF @Aggregate_All_Database_Data = 0
+	BEGIN
+		MERGE INTO dbo.Index_Utilization_Daily_Stats AS Utilization_Target
+		USING (	SELECT
+					@Index_Collection_Date AS Index_Utilization_Detail_Create_Date,
+					Index_Utilization_Detail.[Database_Name],
+					Index_Utilization_Detail.[Schema_Name],
+					Index_Utilization_Detail.Table_Name,
+					Index_Utilization_Detail.Index_Name,
+					Index_Utilization_Detail.User_Seek_Count,
+					Index_Utilization_Detail.User_Scan_Count,
+					Index_Utilization_Detail.User_Lookup_Count,
+					Index_Utilization_Detail.User_Update_Count,
+					Index_Utilization_Detail.Last_User_Seek,
+					Index_Utilization_Detail.Last_User_Scan,
+					Index_Utilization_Detail.Last_User_Lookup,
+					Index_Utilization_Detail.Last_User_Update,
+					Index_Utilization_Detail.Is_Primary_Key,
+					Index_Utilization_Detail.Is_Clustered_Index,
+					Index_Utilization_Daily_Stats.User_Seek_Count_Last_Update,
+					Index_Utilization_Daily_Stats.User_Scan_Count_Last_Update,
+					Index_Utilization_Daily_Stats.User_Lookup_Count_Last_Update,
+					Index_Utilization_Daily_Stats.User_Update_Count_Last_Update
+				FROM #Index_Utilization_Detail Index_Utilization_Detail
+				LEFT JOIN dbo.Index_Utilization_Daily_Stats
+				ON Index_Utilization_Detail.[Database_Name] = Index_Utilization_Daily_Stats.[Database_Name]
+				AND Index_Utilization_Detail.[Schema_Name] = Index_Utilization_Daily_Stats.[Schema_Name]
+				AND Index_Utilization_Detail.Table_Name = Index_Utilization_Daily_Stats.Table_Name
+				AND Index_Utilization_Detail.Index_Name = Index_Utilization_Daily_Stats.Index_Name
+				AND Index_Utilization_Daily_Stats.Index_Utilization_Daily_Stats_Date = DATEADD(DAY, -1, @Index_Collection_Date)) AS Utilization_Source
+		ON (	Utilization_Target.[Database_Name] = Utilization_Source.[Database_Name]
+				AND Utilization_Target.[Schema_Name] = Utilization_Source.[Schema_Name]
+				AND Utilization_Target.Table_Name = Utilization_Source.Table_Name
+				AND Utilization_Target.Index_Name = Utilization_Source.Index_Name
+				AND Utilization_Target.Index_Utilization_Daily_Stats_Date = @Index_Collection_Date	)
+		WHEN MATCHED
+			THEN UPDATE
+				SET User_Seek_Count_Daily = CASE 
+							  			 WHEN Utilization_Source.User_Seek_Count >= Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Source.User_Seek_Count - Utilization_Target.User_Seek_Count_Last_Update + Utilization_Target.User_Seek_Count_Daily
+										 WHEN Utilization_Source.User_Seek_Count < Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Source.User_Seek_Count + Utilization_Target.User_Seek_Count_Daily
+									  END,
+					User_Scan_Count_Daily = CASE 
+							  			 WHEN Utilization_Source.User_Scan_Count >= Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Source.User_Scan_Count - Utilization_Target.User_Scan_Count_Last_Update + Utilization_Target.User_Scan_Count_Daily
+										 WHEN Utilization_Source.User_Scan_Count < Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Source.User_Scan_Count + Utilization_Target.User_Scan_Count_Daily
+									  END,
+					User_Lookup_Count_Daily = CASE 
+							  			 WHEN Utilization_Source.User_Lookup_Count >= Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Source.User_Lookup_Count - Utilization_Target.User_Lookup_Count_Last_Update + Utilization_Target.User_Lookup_Count_Daily
+										 WHEN Utilization_Source.User_Lookup_Count < Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Source.User_Lookup_Count + Utilization_Target.User_Lookup_Count_Daily
+									  END,
+					User_Update_Count_Daily = CASE 
+							  			 WHEN Utilization_Source.User_Update_Count >= Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Source.User_Update_Count - Utilization_Target.User_Update_Count_Last_Update + Utilization_Target.User_Update_Count_Daily
+										 WHEN Utilization_Source.User_Update_Count < Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Source.User_Update_Count + Utilization_Target.User_Update_Count_Daily
+									  END,
+					Last_User_Seek = CASE
+										WHEN Utilization_Source.Last_User_Seek IS NULL THEN Utilization_Target.Last_User_Seek
+										WHEN Utilization_Target.Last_User_Seek IS NULL THEN Utilization_Source.Last_User_Seek
+										WHEN Utilization_Source.Last_User_Seek < Utilization_Target.Last_User_Seek THEN Utilization_Target.Last_User_Seek
+										ELSE Utilization_Source.Last_User_Seek
+									 END,
+					Last_User_Scan = CASE
+										WHEN Utilization_Source.Last_User_Scan IS NULL THEN Utilization_Target.Last_User_Scan
+										WHEN Utilization_Target.Last_User_Scan IS NULL THEN Utilization_Source.Last_User_Scan
+										WHEN Utilization_Source.Last_User_Scan < Utilization_Target.Last_User_Scan THEN Utilization_Target.Last_User_Scan
+										ELSE Utilization_Source.Last_User_Scan
+									 END,
+					Last_User_Lookup = CASE
+										WHEN Utilization_Source.Last_User_Lookup IS NULL THEN Utilization_Target.Last_User_Lookup
+										WHEN Utilization_Target.Last_User_Lookup IS NULL THEN Utilization_Source.Last_User_Lookup
+										WHEN Utilization_Source.Last_User_Lookup < Utilization_Target.Last_User_Lookup THEN Utilization_Target.Last_User_Lookup
+										ELSE Utilization_Source.Last_User_Lookup
+									 END,
+					Last_User_Update = CASE
+										WHEN Utilization_Source.Last_User_Update IS NULL THEN Utilization_Target.Last_User_Update
+										WHEN Utilization_Target.Last_User_Update IS NULL THEN Utilization_Source.Last_User_Update
+										WHEN Utilization_Source.Last_User_Update < Utilization_Target.Last_User_Update THEN Utilization_Target.Last_User_Update
+										ELSE Utilization_Source.Last_User_Update
+									 END,
+					User_Seek_Count_Last_Update = Utilization_Source.User_Seek_Count,
+					User_Scan_Count_Last_Update = Utilization_Source.User_Scan_Count,
+					User_Lookup_Count_Last_Update = Utilization_Source.User_Lookup_Count,
+					User_Update_Count_Last_Update = Utilization_Source.User_Update_Count,
+					Index_Utilization_Daily_Stats_Last_Update_Datetime = CURRENT_TIMESTAMP
+		WHEN NOT MATCHED BY TARGET
+			THEN INSERT
+				(	Index_Utilization_Daily_Stats_Date, [Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count_Daily, User_Scan_Count_Daily, User_Lookup_Count_Daily, User_Update_Count_Daily,
+					Last_User_Seek, Last_User_Scan, Last_User_Lookup, Last_User_Update, User_Seek_Count_Last_Update, User_Scan_Count_Last_Update, User_Lookup_Count_Last_Update,
+					User_Update_Count_Last_Update, Is_Primary_Key, Is_Clustered_Index, Index_Utilization_Daily_Stats_Last_Update_Datetime	)
+			VALUES
+				(	@Index_Collection_Date,
+					Utilization_Source.[Database_Name],
+					Utilization_Source.[Schema_Name],
+					Utilization_Source.Table_Name,
+					Utilization_Source.Index_Name,
+					CASE WHEN Utilization_Source.User_Seek_Count_Last_Update IS NULL
+							THEN ISNULL(Utilization_Source.User_Seek_Count, 0)
+						 WHEN Utilization_Source.User_Seek_Count >= Utilization_Source.User_Seek_Count_Last_Update
+							THEN Utilization_Source.User_Seek_Count - Utilization_Source.User_Seek_Count_Last_Update
+						 ELSE Utilization_Source.User_Seek_Count
+					END,
+					CASE WHEN Utilization_Source.User_Scan_Count_Last_Update IS NULL
+							THEN ISNULL(Utilization_Source.User_Scan_Count, 0)
+						 WHEN Utilization_Source.User_Scan_Count >= Utilization_Source.User_Scan_Count_Last_Update
+							THEN Utilization_Source.User_Scan_Count - Utilization_Source.User_Scan_Count_Last_Update
+						 ELSE Utilization_Source.User_Scan_Count
+					END,
+					CASE WHEN Utilization_Source.User_Lookup_Count_Last_Update IS NULL
+							THEN ISNULL(Utilization_Source.User_Lookup_Count, 0)
+						 WHEN Utilization_Source.User_Lookup_Count >= Utilization_Source.User_Lookup_Count_Last_Update
+							THEN Utilization_Source.User_Lookup_Count - Utilization_Source.User_Lookup_Count_Last_Update
+						 ELSE Utilization_Source.User_Lookup_Count
+					END,
+					CASE WHEN Utilization_Source.User_Update_Count_Last_Update IS NULL
+							THEN ISNULL(Utilization_Source.User_Update_Count, 0)
+						 WHEN Utilization_Source.User_Update_Count >= Utilization_Source.User_Update_Count_Last_Update
+							THEN Utilization_Source.User_Update_Count - Utilization_Source.User_Update_Count_Last_Update
+						 ELSE Utilization_Source.User_Update_Count
+					END,
+					Utilization_Source.Last_User_Seek,
+	  				Utilization_Source.Last_User_Scan,
+					Utilization_Source.Last_User_Lookup,
+					Utilization_Source.Last_User_Update,
+					ISNULL(Utilization_Source.User_Seek_Count, 0),
+					ISNULL(Utilization_Source.User_Scan_Count, 0),
+					ISNULL(Utilization_Source.User_Lookup_Count, 0),
+					ISNULL(Utilization_Source.User_Update_Count, 0),
+					Utilization_Source.Is_Primary_Key,
+					Utilization_Source.Is_Clustered_Index,
+					CURRENT_TIMESTAMP	);
+	END
+	ELSE -- If data is to be pre-aggregated by index, then do so here
+	BEGIN
+		MERGE INTO dbo.Index_Utilization_Daily_Stats AS Utilization_Target
+		USING (	SELECT
+					@Index_Collection_Date AS Index_Utilization_Detail_Create_Date,
+					'ALL' AS [Database_Name],
+					Index_Utilization_Detail.[Schema_Name],
+					Index_Utilization_Detail.Table_Name,
+					Index_Utilization_Detail.Index_Name,
+					SUM(Index_Utilization_Detail.User_Seek_Count) AS User_Seek_Count,
+					SUM(Index_Utilization_Detail.User_Scan_Count) AS User_Scan_Count,
+					SUM(Index_Utilization_Detail.User_Lookup_Count) AS User_Lookup_Count,
+					SUM(Index_Utilization_Detail.User_Update_Count) AS User_Update_Count,
+					MAX(Index_Utilization_Detail.Last_User_Seek) AS Last_User_Seek,
+					MAX(Index_Utilization_Detail.Last_User_Scan) AS Last_User_Scan,
+					MAX(Index_Utilization_Detail.Last_User_Lookup) AS Last_User_Lookup,
+					MAX(Index_Utilization_Detail.Last_User_Update) AS Last_User_Update,
+					MAX(CAST(Index_Utilization_Detail.Is_Primary_Key AS TINYINT)) AS Is_Primary_Key,
+					MAX(CAST(Index_Utilization_Detail.Is_Clustered_Index AS TINYINT)) AS Is_Clustered_Index,
+					Index_Utilization_Daily_Stats.User_Seek_Count_Last_Update,
+					Index_Utilization_Daily_Stats.User_Scan_Count_Last_Update,
+					Index_Utilization_Daily_Stats.User_Lookup_Count_Last_Update,
+					Index_Utilization_Daily_Stats.User_Update_Count_Last_Update
+				FROM #Index_Utilization_Detail Index_Utilization_Detail
+				LEFT JOIN dbo.Index_Utilization_Daily_Stats
+				ON Index_Utilization_Detail.[Schema_Name] = Index_Utilization_Daily_Stats.[Schema_Name]
+				AND Index_Utilization_Detail.Table_Name = Index_Utilization_Daily_Stats.Table_Name
+				AND Index_Utilization_Detail.Index_Name = Index_Utilization_Daily_Stats.Index_Name
+				AND Index_Utilization_Daily_Stats.Index_Utilization_Daily_Stats_Date = DATEADD(DAY, -1, @Index_Collection_Date)
+				AND Index_Utilization_Daily_Stats.[Database_Name] = 'ALL'
+				GROUP BY Index_Utilization_Detail.[Schema_Name], Index_Utilization_Detail.Table_Name, Index_Utilization_Detail.Index_Name,
+						 Index_Utilization_Daily_Stats.User_Seek_Count_Last_Update, Index_Utilization_Daily_Stats.User_Scan_Count_Last_Update, Index_Utilization_Daily_Stats.User_Lookup_Count_Last_Update,
+						 Index_Utilization_Daily_Stats.User_Update_Count_Last_Update) AS Utilization_Source
+		ON (	Utilization_Target.[Database_Name] = 'ALL'
+				AND Utilization_Target.[Schema_Name] = Utilization_Source.[Schema_Name]
+				AND Utilization_Target.Table_Name = Utilization_Source.Table_Name
+				AND Utilization_Target.Index_Name = Utilization_Source.Index_Name
+				AND Utilization_Target.Index_Utilization_Daily_Stats_Date = @Index_Collection_Date	)
+		WHEN MATCHED
+			THEN UPDATE
+				SET User_Seek_Count_Daily = CASE 
+							  			 WHEN Utilization_Source.User_Seek_Count >= Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Source.User_Seek_Count - Utilization_Target.User_Seek_Count_Last_Update + Utilization_Target.User_Seek_Count_Daily
+										 WHEN Utilization_Source.User_Seek_Count < Utilization_Target.User_Seek_Count_Last_Update
+											THEN Utilization_Source.User_Seek_Count + Utilization_Target.User_Seek_Count_Daily
+									  END,
+					User_Scan_Count_Daily = CASE 
+							  			 WHEN Utilization_Source.User_Scan_Count >= Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Source.User_Scan_Count - Utilization_Target.User_Scan_Count_Last_Update + Utilization_Target.User_Scan_Count_Daily
+										 WHEN Utilization_Source.User_Scan_Count < Utilization_Target.User_Scan_Count_Last_Update
+											THEN Utilization_Source.User_Scan_Count + Utilization_Target.User_Scan_Count_Daily
+									  END,
+					User_Lookup_Count_Daily = CASE 
+							  			 WHEN Utilization_Source.User_Lookup_Count >= Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Source.User_Lookup_Count - Utilization_Target.User_Lookup_Count_Last_Update + Utilization_Target.User_Lookup_Count_Daily
+										 WHEN Utilization_Source.User_Lookup_Count < Utilization_Target.User_Lookup_Count_Last_Update
+											THEN Utilization_Source.User_Lookup_Count + Utilization_Target.User_Lookup_Count_Daily
+									  END,
+					User_Update_Count_Daily = CASE 
+							  			 WHEN Utilization_Source.User_Update_Count >= Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Source.User_Update_Count - Utilization_Target.User_Update_Count_Last_Update + Utilization_Target.User_Update_Count_Daily
+										 WHEN Utilization_Source.User_Update_Count < Utilization_Target.User_Update_Count_Last_Update
+											THEN Utilization_Source.User_Update_Count + Utilization_Target.User_Update_Count_Daily
+									  END,
+					Last_User_Seek = CASE
+										WHEN Utilization_Source.Last_User_Seek IS NULL THEN Utilization_Target.Last_User_Seek
+										WHEN Utilization_Target.Last_User_Seek IS NULL THEN Utilization_Source.Last_User_Seek
+										WHEN Utilization_Source.Last_User_Seek < Utilization_Target.Last_User_Seek THEN Utilization_Target.Last_User_Seek
+										ELSE Utilization_Source.Last_User_Seek
+									 END,
+					Last_User_Scan = CASE
+										WHEN Utilization_Source.Last_User_Scan IS NULL THEN Utilization_Target.Last_User_Scan
+										WHEN Utilization_Target.Last_User_Scan IS NULL THEN Utilization_Source.Last_User_Scan
+										WHEN Utilization_Source.Last_User_Scan < Utilization_Target.Last_User_Scan THEN Utilization_Target.Last_User_Scan
+										ELSE Utilization_Source.Last_User_Scan
+									 END,
+					Last_User_Lookup = CASE
+										WHEN Utilization_Source.Last_User_Lookup IS NULL THEN Utilization_Target.Last_User_Lookup
+										WHEN Utilization_Target.Last_User_Lookup IS NULL THEN Utilization_Source.Last_User_Lookup
+										WHEN Utilization_Source.Last_User_Lookup < Utilization_Target.Last_User_Lookup THEN Utilization_Target.Last_User_Lookup
+										ELSE Utilization_Source.Last_User_Lookup
+									 END,
+					Last_User_Update = CASE
+										WHEN Utilization_Source.Last_User_Update IS NULL THEN Utilization_Target.Last_User_Update
+										WHEN Utilization_Target.Last_User_Update IS NULL THEN Utilization_Source.Last_User_Update
+										WHEN Utilization_Source.Last_User_Update < Utilization_Target.Last_User_Update THEN Utilization_Target.Last_User_Update
+										ELSE Utilization_Source.Last_User_Update
+									 END,
+					User_Seek_Count_Last_Update = Utilization_Source.User_Seek_Count,
+					User_Scan_Count_Last_Update = Utilization_Source.User_Scan_Count,
+					User_Lookup_Count_Last_Update = Utilization_Source.User_Lookup_Count,
+					User_Update_Count_Last_Update = Utilization_Source.User_Update_Count,
+					Index_Utilization_Daily_Stats_Last_Update_Datetime = CURRENT_TIMESTAMP
+		WHEN NOT MATCHED BY TARGET
+			THEN INSERT
+				(	Index_Utilization_Daily_Stats_Date, [Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count_Daily, User_Scan_Count_Daily, User_Lookup_Count_Daily, User_Update_Count_Daily,
+					Last_User_Seek, Last_User_Scan, Last_User_Lookup, Last_User_Update, User_Seek_Count_Last_Update, User_Scan_Count_Last_Update, User_Lookup_Count_Last_Update,
+					User_Update_Count_Last_Update, Is_Primary_Key, Is_Clustered_Index, Index_Utilization_Daily_Stats_Last_Update_Datetime	)
+			VALUES
+				(	@Index_Collection_Date,
+					'ALL',
+					Utilization_Source.[Schema_Name],
+					Utilization_Source.Table_Name,
+					Utilization_Source.Index_Name,
+					CASE WHEN Utilization_Source.User_Seek_Count_Last_Update IS NULL
+							THEN ISNULL(Utilization_Source.User_Seek_Count, 0)
+						 WHEN Utilization_Source.User_Seek_Count >= Utilization_Source.User_Seek_Count_Last_Update
+							THEN Utilization_Source.User_Seek_Count - Utilization_Source.User_Seek_Count_Last_Update
+						 ELSE Utilization_Source.User_Seek_Count
+					END,
+					CASE WHEN Utilization_Source.User_Scan_Count_Last_Update IS NULL
+							THEN ISNULL(Utilization_Source.User_Scan_Count, 0)
+						 WHEN Utilization_Source.User_Scan_Count >= Utilization_Source.User_Scan_Count_Last_Update
+							THEN Utilization_Source.User_Scan_Count - Utilization_Source.User_Scan_Count_Last_Update
+						 ELSE Utilization_Source.User_Scan_Count
+					END,
+					CASE WHEN Utilization_Source.User_Lookup_Count_Last_Update IS NULL
+							THEN ISNULL(Utilization_Source.User_Lookup_Count, 0)
+						 WHEN Utilization_Source.User_Lookup_Count >= Utilization_Source.User_Lookup_Count_Last_Update
+							THEN Utilization_Source.User_Lookup_Count - Utilization_Source.User_Lookup_Count_Last_Update
+						 ELSE Utilization_Source.User_Lookup_Count
+					END,
+					CASE WHEN Utilization_Source.User_Update_Count_Last_Update IS NULL
+							THEN ISNULL(Utilization_Source.User_Update_Count, 0)
+						 WHEN Utilization_Source.User_Update_Count >= Utilization_Source.User_Update_Count_Last_Update
+							THEN Utilization_Source.User_Update_Count - Utilization_Source.User_Update_Count_Last_Update
+						 ELSE Utilization_Source.User_Update_Count
+					END,
+					Utilization_Source.Last_User_Seek,
+	  				Utilization_Source.Last_User_Scan,
+					Utilization_Source.Last_User_Lookup,
+					Utilization_Source.Last_User_Update,
+					ISNULL(Utilization_Source.User_Seek_Count, 0),
+					ISNULL(Utilization_Source.User_Scan_Count, 0),
+					ISNULL(Utilization_Source.User_Lookup_Count, 0),
+					ISNULL(Utilization_Source.User_Update_Count, 0),
+					Utilization_Source.Is_Primary_Key,
+					Utilization_Source.Is_Clustered_Index,
+					CURRENT_TIMESTAMP	);
+	END
+	
+	-- Check for any indexes that are completely unused, and therefore do not appear in any index stats usage DMV data.
+	-- Update summary and daily stats data as needed based on this data.
+	IF @Aggregate_All_Database_Data = 0
+	BEGIN
+		INSERT INTO dbo.Index_Utilization_Summary
+		(	[Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count_Total, User_Scan_Count_Total, User_Lookup_Count_Total, User_Update_Count_Total, Last_User_Seek,
+	  		Last_User_Scan, Last_User_Lookup, Last_User_Update, Index_Utilization_Summary_Create_Datetime, Index_Utilization_Summary_Last_Update_Datetime,
+			User_Seek_Count_Last_Update, User_Scan_Count_Last_Update, User_Lookup_Count_Last_Update, User_Update_Count_Last_Update,
+			Is_Primary_Key, Is_Clustered_Index, Is_Unused, Is_Dropped	)
+		SELECT
+			All_Index_Data.[Database_Name],
+			All_Index_Data.[Schema_Name],
+			All_Index_Data.Table_Name,
+			All_Index_Data.Index_Name,
+			0 AS User_Seek_Count_Total,
+			0 AS User_Scan_Count_Total,
+			0 AS User_Lookup_Count_Total,
+			0 AS User_Update_Count_Total,
+			NULL AS Last_User_Seek,
+			NULL AS Last_User_Scan,
+			NULL AS Last_User_Lookup,
+			NULL AS Last_User_Update,
+			CURRENT_TIMESTAMP AS Index_Utilization_Summary_Create_Datetime,
+			CURRENT_TIMESTAMP AS Index_Utilization_Summary_Last_Update_Datetime,
+			0 AS User_Seek_Count_Last_Update,
+			0 AS User_Scan_Count_Last_Update,
+			0 AS User_Lookup_Count_Last_Update,
+			0 AS User_Update_Count_Last_Update,
+			All_Index_Data.Is_Primary_Key,
+			All_Index_Data.Is_Clustered_Index,
+			1 AS Is_Unused,
+			0 AS Is_Dropped
+		FROM #All_Indexes All_Index_Data
+		LEFT JOIN dbo.Index_Utilization_Summary
+		ON All_Index_Data.[Database_Name] = Index_Utilization_Summary.[Database_Name]
+		AND All_Index_Data.[Schema_Name] = Index_Utilization_Summary.[Schema_Name]
+		AND All_Index_Data.Table_Name = Index_Utilization_Summary.Table_Name
+		AND All_Index_Data.Index_Name = Index_Utilization_Summary.Index_Name
+		WHERE Index_Utilization_Summary.Index_Utilization_Summary_Id IS NULL;
+
+		INSERT INTO dbo.Index_Utilization_Daily_Stats
+		(	Index_Utilization_Daily_Stats_Date, [Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count_Daily, User_Scan_Count_Daily, User_Lookup_Count_Daily, User_Update_Count_Daily,
+			Last_User_Seek, Last_User_Scan, Last_User_Lookup, Last_User_Update, User_Seek_Count_Last_Update, User_Scan_Count_Last_Update, User_Lookup_Count_Last_Update,
+			User_Update_Count_Last_Update, Is_Primary_Key, Is_Clustered_Index, Index_Utilization_Daily_Stats_Last_Update_Datetime	)
+		SELECT
+			@Index_Collection_Date,
+			All_Index_Data.[Database_Name],
+			All_Index_Data.[Schema_Name],
+			All_Index_Data.Table_Name,
+			All_Index_Data.Index_Name,
+			0 AS User_Seek_Count_Daily,
+			0 AS User_Scan_Count_Daily,
+			0 AS User_Lookup_Count_Daily,
+			0 AS User_Update_Count_Daily,
+			NULL AS Last_User_Seek,
+			NULL AS Last_User_Scan,
+			NULL AS Last_User_Lookup,
+			NULL AS Last_User_Update,
+			0 AS User_Seek_Count_Last_Update,
+			0 AS User_Scan_Count_Last_Update,
+			0 AS User_Lookup_Count_Last_Update,
+			0 AS User_Update_Count_Last_Update,
+			All_Index_Data.Is_Primary_Key,
+			All_Index_Data.Is_Clustered_Index,
+			CURRENT_TIMESTAMP AS Index_Utilization_Daily_Stats_Last_Update_Datetime
+		FROM #All_Indexes All_Index_Data
+		LEFT JOIN dbo.Index_Utilization_Daily_Stats
+		ON All_Index_Data.[Database_Name] = Index_Utilization_Daily_Stats.[Database_Name]
+		AND All_Index_Data.[Schema_Name] = Index_Utilization_Daily_Stats.[Schema_Name]
+		AND All_Index_Data.Table_Name = Index_Utilization_Daily_Stats.Table_Name
+		AND All_Index_Data.Index_Name = Index_Utilization_Daily_Stats.Index_Name
+		AND Index_Utilization_Daily_Stats.Index_Utilization_Daily_Stats_Date = @Index_Collection_Date
+		WHERE Index_Utilization_Daily_Stats.Index_Utilization_Daily_Stats_Id IS NULL;
+	END
+	ELSE -- If we are aggregating all database data together, then do so here
+	BEGIN
+		INSERT INTO dbo.Index_Utilization_Summary
+		(	[Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count_Total, User_Scan_Count_Total, User_Lookup_Count_Total, User_Update_Count_Total, Last_User_Seek,
+	  		Last_User_Scan, Last_User_Lookup, Last_User_Update, Index_Utilization_Summary_Create_Datetime, Index_Utilization_Summary_Last_Update_Datetime,
+			User_Seek_Count_Last_Update, User_Scan_Count_Last_Update, User_Lookup_Count_Last_Update, User_Update_Count_Last_Update,
+			Is_Primary_Key, Is_Clustered_Index, Is_Unused, Is_Dropped	)
+		SELECT
+			'ALL',
+			All_Index_Data.[Schema_Name],
+			All_Index_Data.Table_Name,
+			All_Index_Data.Index_Name,
+			0 AS User_Seek_Count_Total,
+			0 AS User_Scan_Count_Total,
+			0 AS User_Lookup_Count_Total,
+			0 AS User_Update_Count_Total,
+			NULL AS Last_User_Seek,
+			NULL AS Last_User_Scan,
+			NULL AS Last_User_Lookup,
+			NULL AS Last_User_Update,
+			CURRENT_TIMESTAMP AS Index_Utilization_Summary_Create_Datetime,
+			CURRENT_TIMESTAMP AS Index_Utilization_Summary_Last_Update_Datetime,
+			0 AS User_Seek_Count_Last_Update,
+			0 AS User_Scan_Count_Last_Update,
+			0 AS User_Lookup_Count_Last_Update,
+			0 AS User_Update_Count_Last_Update,
+			MAX(CAST(All_Index_Data.Is_Primary_Key AS TINYINT)),
+			MAX(CAST(All_Index_Data.Is_Clustered_Index AS TINYINT)),
+			1 AS Is_Unused,
+			0 AS Is_Dropped
+		FROM #All_Indexes All_Index_Data
+		LEFT JOIN dbo.Index_Utilization_Summary
+		ON Index_Utilization_Summary.[Database_Name] = 'ALL'
+		AND All_Index_Data.[Schema_Name] = Index_Utilization_Summary.[Schema_Name]
+		AND All_Index_Data.Table_Name = Index_Utilization_Summary.Table_Name
+		AND All_Index_Data.Index_Name = Index_Utilization_Summary.Index_Name
+		WHERE Index_Utilization_Summary.Index_Utilization_Summary_Id IS NULL
+		GROUP BY All_Index_Data.[Schema_Name], All_Index_Data.Table_Name, All_Index_Data.Index_Name;
+
+		INSERT INTO dbo.Index_Utilization_Daily_Stats
+		(	Index_Utilization_Daily_Stats_Date, [Database_Name], [Schema_Name], Table_Name, Index_Name, User_Seek_Count_Daily, User_Scan_Count_Daily, User_Lookup_Count_Daily, User_Update_Count_Daily,
+			Last_User_Seek, Last_User_Scan, Last_User_Lookup, Last_User_Update, User_Seek_Count_Last_Update, User_Scan_Count_Last_Update, User_Lookup_Count_Last_Update,
+			User_Update_Count_Last_Update, Is_Primary_Key, Is_Clustered_Index, Index_Utilization_Daily_Stats_Last_Update_Datetime	)
+		SELECT
+			@Index_Collection_Date,
+			'ALL' AS [Database_Name],
+			All_Index_Data.[Schema_Name],
+			All_Index_Data.Table_Name,
+			All_Index_Data.Index_Name,
+			0 AS User_Seek_Count_Daily,
+			0 AS User_Scan_Count_Daily,
+			0 AS User_Lookup_Count_Daily,
+			0 AS User_Update_Count_Daily,
+			NULL AS Last_User_Seek,
+			NULL AS Last_User_Scan,
+			NULL AS Last_User_Lookup,
+			NULL AS Last_User_Update,
+			0 AS User_Seek_Count_Last_Update,
+			0 AS User_Scan_Count_Last_Update,
+			0 AS User_Lookup_Count_Last_Update,
+			0 AS User_Update_Count_Last_Update,
+			MAX(CAST(All_Index_Data.Is_Primary_Key AS TINYINT)),
+			MAX(CAST(All_Index_Data.Is_Clustered_Index AS TINYINT)),
+			CURRENT_TIMESTAMP AS Index_Utilization_Daily_Stats_Last_Update_Datetime
+		FROM #All_Indexes All_Index_Data
+		LEFT JOIN dbo.Index_Utilization_Daily_Stats
+		ON Index_Utilization_Daily_Stats.[Database_Name] = 'ALL'
+		AND All_Index_Data.[Schema_Name] = Index_Utilization_Daily_Stats.[Schema_Name]
+		AND All_Index_Data.Table_Name = Index_Utilization_Daily_Stats.Table_Name
+		AND All_Index_Data.Index_Name = Index_Utilization_Daily_Stats.Index_Name
+		AND Index_Utilization_Daily_Stats.Index_Utilization_Daily_Stats_Date = @Index_Collection_Date
+		WHERE Index_Utilization_Daily_Stats.Index_Utilization_Daily_Stats_Id IS NULL
+		GROUP BY All_Index_Data.[Schema_Name], All_Index_Data.Table_Name, All_Index_Data.Index_Name;
+	END
+
+	DROP TABLE #All_Indexes;
+	DROP TABLE #Index_Utilization_Detail;
+END
+GO
+
+
